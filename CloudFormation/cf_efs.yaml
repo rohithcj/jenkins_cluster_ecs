@@ -1,0 +1,100 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: CloudFormation Stack for EFS 
+
+Parameters:
+  Environment:
+    Description: "Environment name where stack needs to be deployed"
+    Type: String
+    AllowedValues:
+      - DEV
+      - QAT
+      - UAT
+      - PROD
+  AppName:
+    Description: "Application Name"
+    Type: String
+  VpcId:
+    Description: "VpcId required for security group"
+    Type: AWS::EC2::VPC::Id
+  SourceSecurityGroupId:
+    Description: "AWS security group ID to allow to connect to the EFS"
+    Type: AWS::EC2::SecurityGroup::Id
+  SubnetId:
+    Description: "List of Subnets"
+    Type: List<AWS::EC2::Subnet::Id>
+  SourceCidr:
+    Description: "Source Cidr ECS/EC2 Cluster where EFS needs to be mounted"
+    Type: String
+
+Resources:
+
+  EFSSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+        GroupName: !Sub '${AWS::StackName}-SGEFS'
+        GroupDescription: "Allow EFS Connectivity"
+        VpcId: !Ref "VpcId"
+        SecurityGroupIngress:
+        - IpProtocol: "tcp"
+          FromPort: "2049"
+          ToPort: "2049"
+          CidrIp: !Ref "SourceCidr"
+        SecurityGroupEgress:
+        - IpProtocol: "-1"
+          CidrIp: "0.0.0.0/0"
+
+  EFS:
+    Type : AWS::EFS::FileSystem
+    Properties:
+      FileSystemTags:
+      - Key: "Env"
+        Value: !Ref "Environment" 
+      - Key: "Name"
+        Value: !Ref "AppName"
+
+  EFSId:
+    Type: "AWS::SSM::Parameter"
+    Properties:
+      Name: !Sub "${AWS::StackName}-EFSId"
+      Type: "String"
+      Value: !Ref EFS
+      Description: "EFS Id"
+      
+  EFSMOUNTTARGETAZ1:
+    Type: AWS::EFS::MountTarget
+    DependsOn: 
+      - "EFS"
+      - "EFSSecurityGroup"
+    Properties: 
+      FileSystemId: !Ref "EFS"
+      SecurityGroups:
+        - !GetAtt "EFSSecurityGroup.GroupId"
+      SubnetId: !Select [ "0", !Ref SubnetId ]
+
+  EFSMOUNTTARGETAZ2:
+    Type: AWS::EFS::MountTarget
+    Properties: 
+      FileSystemId: !Ref "EFS"
+      SecurityGroups:
+        - !GetAtt "EFSSecurityGroup.GroupId"
+      SubnetId: !Select [ "1", !Ref "SubnetId" ]
+
+Outputs:
+  EFSId:
+    Description: "ID of the EFS"
+    Value: !Ref "EFS"
+  EFSSSMName:
+    Description: "SSM Parameter Name which needs to be referenced in Jenkins Master Stack"
+    Value: !Ref "EFSId"
+  EFSMOUNTTARGETAZ1Id:
+    Description: "ID of the EFS Mount Target"
+    Value: !Ref "EFSMOUNTTARGETAZ1"
+  EFSMOUNTTARGETAZ2Id:
+    Description: "ID of the EFS Mount Target"
+    Value: !Ref "EFSMOUNTTARGETAZ2"
+  EFSIPAZ1:
+    Description: "IP Address of the EFS Mount Target"
+    Value: !GetAtt "EFSMOUNTTARGETAZ2.IpAddress"
+  EFSIPAZ2:
+    Description: "IP Address of the EFS Mount Target"
+    Value: !GetAtt "EFSMOUNTTARGETAZ2.IpAddress"

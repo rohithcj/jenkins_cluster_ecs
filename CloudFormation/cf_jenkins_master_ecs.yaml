@@ -1,0 +1,541 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: CloudFormation Stack for Jenkins ECS Cluster
+
+Parameters:
+  Environment:
+    Description: "Environment name where stack needs to be deployed"
+    Type: String
+    AllowedValues:
+      - DEV
+      - QAT
+      - UAT
+      - PROD
+  AppName:
+    Description: "Application Name"
+    Type: String
+  SubnetCidr:
+    Description: "cidr block of subnets to allow jenkins master and worker communication"
+    Type: String
+  OnPremCidr:
+    Description: "cidr block of external Network for Jenkins Access"
+    Type: String
+  VpcId:
+    Description: "VpcId required for security group"
+    Type: AWS::EC2::VPC::Id
+  SubnetId:
+    Description: "List of Subnets"
+    Type: List<AWS::EC2::Subnet::Id>
+  CpuUnits:
+    Description: "Cpu Units for Task Definition"
+    Type: String
+  MemoryUnits:
+    Description: "Memory Units for Task Definition"
+    Type: String
+  EFSId:
+    Description: "EFS filesystem ID"
+    Type : 'AWS::SSM::Parameter::Value<String>'
+    Default: "Jenkins-EFS-DEV-EFSId"
+
+  EFSMountPath:
+    Description: "The path on the EC2 host where EFS file system will be mounted"
+    Default: "/mnt/JENKINS_HOME"
+    Type: String
+  DockerImage:
+    Description: "Jenkins docker image and version"
+    Type: String
+    Default: "docker.io/jenkins/jenkins:2.176.1"
+  ECSLogGroup:
+    Description: "The CloudWatch log group that will be created for Jenkins logs"
+    Type: String
+  HealthCheckPath:
+    Description: "Health check path for application loab balancer"
+    Type: String
+  ImageId:
+    Description: "The AWS ami id to use"
+    Default: "ami-04fc06e24a65297fb"
+    Type: String
+  InstanceType:
+    Description: "The AWS instance type to use"
+    Default: "t2.large"
+    Type: String
+  KeyName:
+    Description: "EC2 Key Pair attached to the instance"
+    Type: String
+  ECSReservedMem:
+    Default: "1024"
+    Type: String
+  ECSInitLogStream:
+    Default: "/var/log/ecs/ecs-init.log"
+    Type: String
+  ECSInitLogPath:
+    Default: "/var/log/ecs/ecs-init.log*"
+    Type: String
+  ECSAgentLogStream:
+    Default: "/var/log/ecs/ecs-agent.log"
+    Type: String
+  ECSAgentLogPath:
+    Default: "/var/log/ecs/ecs-agent.log*"
+    Type: String
+  ECSCniBridgeLogStream:
+    Default: "/var/log/ecs/ecs-cni-bridge-plugin.log"
+    Type: String
+  ECSCniBridgeLogPath:
+    Default: "/var/log/ecs/ecs-cni-bridge-plugin.log*"
+    Type: String
+  ECSCniEniLogStream:
+    Default: "/var/log/ecs/ecs-cni-eni-plugin.log"
+    Type: String
+  ECSCniEniLogPath:
+    Default: "/var/log/ecs/ecs-cni-eni-plugin.log*"
+    Type: String
+  CustomUserdata:
+    Default: "echo 'custom userdata goes here'"
+    Type: String
+  ECSConfig:
+    Default: "echo '' > /etc/ecs/ecs.config"
+    Type: String
+  ALBCertArn:
+    Description: "ACM Cert Arn for ALB"
+    Type: String
+
+Resources:
+
+  ALBSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+        GroupName: !Sub '${AWS::StackName}-SGLB'
+        GroupDescription: "Security Group for ALB Jenkins"
+        VpcId: !Ref "VpcId"
+        SecurityGroupIngress:
+        - IpProtocol: "tcp"
+          FromPort: "80"
+          ToPort: "80"
+          CidrIp: !Ref "SubnetCidr"
+        - IpProtocol: "tcp"
+          FromPort: "80"
+          ToPort: "80"
+          CidrIp: !Ref "OnPremCidr"
+        - IpProtocol: "tcp"
+          FromPort: "443"
+          ToPort: "443"
+          CidrIp: !Ref "SubnetCidr"
+        - IpProtocol: "tcp"
+          FromPort: "443"
+          ToPort: "443"
+          CidrIp: !Ref "OnPremCidr"
+        - IpProtocol: "tcp"
+          FromPort: "50000"
+          ToPort: "50000"
+          CidrIp: !Ref "SubnetCidr"
+        SecurityGroupEgress:
+        - IpProtocol: "-1"
+          CidrIp: "0.0.0.0/0"
+
+  ECSSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+        GroupName: !Sub '${AWS::StackName}-SGECS'
+        GroupDescription: "Security Group for ECS Jenkins"
+        VpcId: !Ref "VpcId"
+        SecurityGroupIngress:
+        - IpProtocol: "tcp"
+          FromPort: "8080"
+          ToPort: "8080"
+          SourceSecurityGroupId: !GetAtt ALBSG.GroupId
+        - IpProtocol: "tcp"
+          FromPort: "50000"
+          ToPort: "50000"
+          CidrIp: !Ref "SubnetCidr"
+        - IpProtocol: "tcp"
+          FromPort: "80"
+          ToPort: "80"
+          CidrIp: !Ref "SubnetCidr"
+        SecurityGroupEgress:
+        - IpProtocol: "-1"
+          CidrIp: "0.0.0.0/0"
+
+  ECSExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-ECSExecutionRole'
+      AssumeRolePolicyDocument: {
+        "Version": "2008-10-17",
+        "Statement": [
+          {
+            "Action": "sts:AssumeRole",
+            "Principal": {
+              "Service": "ecs-tasks.amazonaws.com"
+            },
+            "Effect": "Allow"
+          }
+        ]
+      }
+      ManagedPolicyArns: 
+        - "arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy"
+
+
+  EC2RoleMaster:
+    Type: AWS::IAM::Role
+    Properties:
+      ManagedPolicyArns:
+        - "arn:aws:iam::aws:policy/AWSCodeCommitReadOnly"
+      AssumeRolePolicyDocument:
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service: [ec2.amazonaws.com]
+          Action: ['sts:AssumeRole']
+      Path: /
+      Policies:
+      - PolicyName: ecs-service
+        PolicyDocument:
+          Statement:
+          - Effect: Allow
+            Action: ['ecs:CreateCluster', 'ecs:DeregisterContainerInstance', 'ecs:DiscoverPollEndpoint',
+              'ecs:Poll', 'ecs:RegisterContainerInstance', 'ecs:StartTelemetrySession',
+              'ecs:Submit*', 'logs:CreateLogStream', 'logs:PutLogEvents', "ecs:ListClusters", "ecs:DescribeContainerInstances",
+              "ecs:RegisterTaskDefinition", "ecs:DeregisterTaskDefinition", "ecs:ListTaskDefinitions", "ecs:DescribeTaskDefinition",
+              "ecs:RunTask", "ecs:StopTask", "ecs:ListContainerInstances", "ecs:DescribeTasks",
+              "ecr:GetAuthorizationToken", "ecr:GetDownloadUrlForLayer", "ecr:BatchGetImage", "ecr:BatchCheckLayerAvailability"]
+            Resource: '*'
+      - PolicyName: nlb-register
+        PolicyDocument:
+          Statement:
+          - Effect: Allow
+            Action: ['tag:GetResources', 'elasticloadbalancing:RegisterTargets']
+            Resource: '*'
+
+  AutoscalingRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service: [application-autoscaling.amazonaws.com]
+          Action: ['sts:AssumeRole']
+      Path: /
+      Policies:
+      - PolicyName: service-autoscaling
+        PolicyDocument:
+          Statement:
+          - Effect: Allow
+            Action: ['application-autoscaling:*', 'cloudwatch:DescribeAlarms', 'cloudwatch:PutMetricAlarm',
+              'ecs:DescribeServices', 'ecs:UpdateService']
+            Resource: '*'
+
+  EC2InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Path: /
+      Roles: [!Ref 'EC2RoleMaster']
+      
+  ECSTaskDef:
+    Type: AWS::ECS::TaskDefinition
+    DependsOn:
+      - "ECSExecutionRole"
+    Properties: 
+      ContainerDefinitions: 
+        - Name: !Sub '${AWS::StackName}-${AppName}'
+          Cpu: "0"
+          Environment:
+            - Name: "JAVA_OPTS"
+              Value: "-Dhudson.DNSMultiCast.disabled=true"
+          Essential: "true"
+          Image: !Ref "DockerImage"
+          LogConfiguration: 
+            LogDriver: "awslogs"
+            Options:
+              awslogs-group: !Ref "ECSLogGroup"
+              awslogs-region: !Ref "AWS::Region"
+              awslogs-stream-prefix: !Ref "AWS::StackName"
+          PortMappings:
+            - ContainerPort: "8080"
+              HostPort: "8080"
+              Protocol: "tcp"
+            - ContainerPort: "50000"
+              HostPort: "50000"
+              Protocol: "tcp"
+          MountPoints:
+            - SourceVolume: "jenkins_home" 
+              ContainerPath: "/var/jenkins_home"       
+      Cpu: !Ref "CpuUnits"
+      ExecutionRoleArn: !GetAtt "ECSExecutionRole.Arn"
+      Family: !Sub '${AWS::StackName}-${AppName}'
+      Memory: !Ref "MemoryUnits"
+      NetworkMode: "host"
+      RequiresCompatibilities: 
+        - "EC2"
+      Tags: 
+        - Key: "Env"
+          Value: !Ref Environment 
+        - Key: "Name"
+          Value: !Ref "AppName"
+      Volumes: 
+        - Host: 
+            SourcePath: !Ref "EFSMountPath"
+          Name: "jenkins_home"
+
+
+  ALB:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    DependsOn:
+      - "ALBSG"
+    Properties: 
+      Name: !Sub '${AWS::StackName}-ALB'
+      IpAddressType: "ipv4"
+      Scheme: "internal"
+      SecurityGroups: 
+        - !GetAtt ALBSG.GroupId
+      Subnets: !Ref SubnetId
+      Tags: 
+        - Key: "Env"
+          Value: !Ref Environment 
+        - Key: "Name"
+          Value: !Ref "AppName"
+      Type: "application"
+
+
+  ALBTG:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties: 
+      HealthCheckEnabled: "true"
+      HealthCheckIntervalSeconds: "30"
+      HealthCheckPath: !Ref HealthCheckPath
+      HealthCheckPort: "8080"
+      HealthCheckProtocol: "HTTP"
+      HealthCheckTimeoutSeconds: "10"
+      HealthyThresholdCount: "3"
+      UnhealthyThresholdCount: "3"
+      Matcher: 
+        HttpCode: "200-499"
+      Port: "8080"
+      Protocol: "HTTP"
+      Tags: 
+        - Key: "Env"
+          Value: !Ref "Environment" 
+        - Key: "Name"
+          Value: !Ref "AppName"
+      TargetGroupAttributes: 
+        - Key: "stickiness.type"
+          Value: "lb_cookie"
+      TargetType: "instance"
+      UnhealthyThresholdCount: "3"
+      VpcId: !Ref "VpcId"
+
+  ALBListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    DependsOn:
+      - "ALB"
+      - "ALBTG"
+    Properties: 
+      Certificates:
+        - CertificateArn: !Ref ALBCertArn
+      DefaultActions: 
+        - TargetGroupArn: !Ref "ALBTG"
+          Type: "forward" 
+      LoadBalancerArn: !Ref "ALB"
+      Port: "443"
+      Protocol: "HTTPS"
+  NLB:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    DependsOn:
+      - "ALBSG"
+    Properties: 
+      Name: !Sub '${AWS::StackName}-NLB'
+      IpAddressType: "ipv4"
+      Scheme: "internal"
+      Subnets: !Ref SubnetId
+      Tags: 
+        - Key: "Env"
+          Value: !Ref Environment 
+        - Key: "Name"
+          Value: !Ref "AppName"
+      Type: "network"
+
+  NLBTG:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties: 
+      HealthCheckEnabled: "true"
+      HealthCheckIntervalSeconds: "30"
+      HealthCheckPort: "50000"
+      HealthCheckProtocol: "TCP"
+      HealthCheckTimeoutSeconds: "10"
+      HealthyThresholdCount: "3"
+      UnhealthyThresholdCount: "3"
+      Port: "50000"
+      Protocol: "TCP"
+      Tags: 
+        - Key: "Env"
+          Value: !Ref "Environment" 
+        - Key: "Name"
+          Value: !Ref "AppName"
+        - Key: "AutoRegNLBName"
+          Value: !Sub '${AWS::StackName}-NLB'
+      TargetType: "instance"
+      UnhealthyThresholdCount: "3"
+      VpcId: !Ref "VpcId"
+
+  NLBListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    DependsOn:
+      - "NLB"
+      - "ALBTG"
+    Properties: 
+      DefaultActions: 
+        - TargetGroupArn: !Ref "NLBTG"
+          Type: "forward" 
+      LoadBalancerArn: !Ref "NLB"
+      Port: "50000"
+      Protocol: "TCP"
+
+  ECSLaunchConfig:
+    Type: AWS::AutoScaling::LaunchConfiguration
+    DependsOn:
+      - "ECSSG"
+    Properties:
+      EbsOptimized: "false"
+      IamInstanceProfile: !Ref EC2InstanceProfile
+      ImageId: !Ref ImageId
+      InstanceMonitoring: "true"
+      InstanceType: !Ref "InstanceType"
+      KeyName: !Ref "KeyName"
+      SecurityGroups: 
+        - !GetAtt "ECSSG.GroupId"
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          #Cfn Signal
+          yum install -y aws-cfn-bootstrap
+          /opt/aws/bin/cfn-signal -e $? --stack ${AWS::StackName} --resource ECSAutoScalingGroup --region ${AWS::Region}      
+          
+          # yum update
+          yum update -y
+
+          #EFS Configs for jenkins
+          yum install -y amazon-efs-utils
+          yum install -y nfs-utils
+          mkdir -p ${EFSMountPath}
+          mount -t nfs4 -o nfsvers=4.1,rsize=1048576,wsize=1048576,hard,timeo=600,retrans=2 ${EFSId}.efs.${AWS::Region}.amazonaws.com:/ ${EFSMountPath}
+          cd ${EFSMountPath}
+          chmod go+rw .      
+          # ECS config
+          ${ECSConfig}
+          {
+            echo ECS_CLUSTER=${AWS::StackName}-${AppName}
+            echo ECS_AVAILABLE_LOGGING_DRIVERS=[\"json-file\",\"awslogs\"]
+            echo ECS_RESERVED_MEMORY=${ECSReservedMem}
+          } >> /etc/ecs/ecs.config
+                
+          # Installing CloudWatch Log Agent
+          yum install -y awslogs
+                
+          # Inject the CloudWatch Logs configuration file contents
+          cat > /etc/awslogs/awslogs.conf <<- EOF
+          [general]
+          state_file = /var/lib/awslogs/agent-state        
+                
+          [${ECSInitLogStream}]
+          file = ${ECSInitLogPath}
+          log_group_name = ${ECSLogGroup}
+          log_stream_name = {instance_id}${ECSInitLogStream}
+          datetime_format = %Y-%m-%dT%H:%M:%SZ
+                
+          [${ECSAgentLogStream}]
+          file = ${ECSAgentLogPath}
+          log_group_name = ${ECSLogGroup}
+          log_stream_name = {instance_id}${ECSAgentLogStream}
+          datetime_format = %Y-%m-%dT%H:%M:%SZ
+                
+          [${ECSCniBridgeLogStream}]
+          file = ${ECSCniBridgeLogPath}
+          log_group_name = ${ECSLogGroup}
+          log_stream_name = {instance_id}${ECSCniBridgeLogStream}
+          datetime_format = %Y-%m-%dT%H:%M:%SZ
+                
+          [${ECSCniEniLogStream}]
+          file = ${ECSCniEniLogPath}
+          log_group_name = ${ECSLogGroup}
+          log_stream_name = {instance_id}${ECSCniEniLogStream}
+          datetime_format = %Y-%m-%dT%H:%M:%SZ
+          EOF
+                
+          # Set the region to send CloudWatch Logs data to (the region where the container instance is located)
+          sed -i -e "s/region = us-east-1/region = ${AWS::Region}/g" /etc/awslogs/awscli.conf
+          systemctl enable awslogsd.service
+          systemctl start awslogsd
+
+          #Register NLB
+          yum install -y jq
+          aws elbv2 register-targets --target-group-arn $(aws resourcegroupstaggingapi get-resources --tag-filters Key=AutoRegNLBName,Values=${AWS::StackName}-NLB --region ${AWS::Region}|jq '.ResourceTagMappingList[].ResourceARN' | tr -d '"') --targets Id=$(curl http://169.254.169.254/latest/meta-data/instance-id 2>/dev/null) --region ${AWS::Region}
+                
+          ${CustomUserdata}     
+          echo "Done"
+          #######EndOfUserData#####
+
+  ECSCluster:          
+    Type: AWS::ECS::Cluster
+    Properties: 
+      ClusterName: !Sub '${AWS::StackName}-${AppName}'
+      Tags: 
+        - Key: "Env"
+          Value: !Ref Environment 
+        - Key: "Name"
+          Value: !Ref "AppName"
+
+  ECSAutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    DependsOn: 
+      - "ECSCluster"
+      - "NLBTG"
+    Properties:
+      VPCZoneIdentifier: !Ref SubnetId
+      LaunchConfigurationName: !Ref 'ECSLaunchConfig'
+      MinSize: "1"
+      MaxSize: "1"
+      DesiredCapacity: "1"
+    CreationPolicy:
+      ResourceSignal:
+        Timeout: "PT15M"
+    UpdatePolicy:
+      AutoScalingReplacingUpdate:
+        WillReplace: "true"
+
+  CloudwatchLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties: 
+      LogGroupName: !Ref "ECSLogGroup"
+      RetentionInDays: "7"
+
+  ECSService:
+    Type: AWS::ECS::Service
+    DependsOn: 
+      - "ALBListener"
+      - "ECSTaskDef"
+      - "ECSAutoScalingGroup"
+    Properties:
+      Cluster: !GetAtt "ECSCluster.Arn"
+      DeploymentConfiguration: 
+          MaximumPercent: "200"
+          MinimumHealthyPercent: "0"
+      DesiredCount: "1"
+      HealthCheckGracePeriodSeconds: "120"
+      LaunchType: "EC2"
+      LoadBalancers: 
+        - ContainerName: !Sub '${AWS::StackName}-${AppName}'
+          ContainerPort: "8080"
+          TargetGroupArn: !Ref "ALBTG"
+      Tags: 
+        - Key: "Env"
+          Value: !Ref Environment 
+        - Key: "Name"
+          Value: !Ref "AppName"
+      TaskDefinition: !Ref "ECSTaskDef"
+
+Outputs:
+  ALBDNS:
+    Description: "DNS name of Application Loadbalancer"
+    Value: !GetAtt "ALB.DNSName"
+  NLBDNS:
+    Description: "DNS name of Network Loadbalancer"
+    Value: !GetAtt "NLB.DNSName"

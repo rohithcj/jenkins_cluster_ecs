@@ -1,0 +1,323 @@
+
+AWSTemplateFormatVersion: '2010-09-09'
+Description: CloudFormation Stack for Jenkins ECS Cluster
+
+Parameters:
+  Environment:
+    Description: "Environment name where stack needs to be deployed"
+    Type: String
+    AllowedValues:
+      - DEV
+      - QAT
+      - UAT
+      - PROD
+  AppName:
+    Description: "Application Name"
+    Type: String
+  SubnetCidr:
+    Description: "cidr block of subnets to allow jenkins master and worker communication"
+    Type: String
+  VpcId:
+    Description: "VpcId required for security group"
+    Type: AWS::EC2::VPC::Id
+  SubnetId:
+    Description: "List of Subnets"
+    Type: List<AWS::EC2::Subnet::Id>
+  ECSLogGroup:
+    Description: "The CloudWatch log group that will be created for Jenkins logs"
+    Type: String
+  ImageId:
+    Description: "The AWS ami id to use"
+    Default: "ami-04fc06e24a65297fb"
+    Type: String
+  InstanceType:
+    Description: "The AWS instance type to use"
+    Default: "t2.large"
+    Type: String
+  KeyName:
+    Description: "EC2 Key Pair attached to the instance"
+    Type: String
+  ECSReservedMem:
+    Default: "1024"
+    Type: String
+  ECSInitLogStream:
+    Default: "/var/log/ecs/ecs-init.log"
+    Type: String
+  ECSInitLogPath:
+    Default: "/var/log/ecs/ecs-init.log*"
+    Type: String
+  ECSAgentLogStream:
+    Default: "/var/log/ecs/ecs-agent.log"
+    Type: String
+  ECSAgentLogPath:
+    Default: "/var/log/ecs/ecs-agent.log*"
+    Type: String
+  ECSCniBridgeLogStream:
+    Default: "/var/log/ecs/ecs-cni-bridge-plugin.log"
+    Type: String
+  ECSCniBridgeLogPath:
+    Default: "/var/log/ecs/ecs-cni-bridge-plugin.log*"
+    Type: String
+  ECSCniEniLogStream:
+    Default: "/var/log/ecs/ecs-cni-eni-plugin.log"
+    Type: String
+  ECSCniEniLogPath:
+    Default: "/var/log/ecs/ecs-cni-eni-plugin.log*"
+    Type: String
+  CustomUserdata:
+    Default: "echo 'custom userdata goes here'"
+    Type: String
+  ECSConfig:
+    Default: "echo '' > /etc/ecs/ecs.config"
+    Type: String
+  AppAccountAssumeRole:
+    Type: String
+    Description: "Rolename created in Target Accounts which Jenkins needs to be assumed to run cloudformation. This Role needs to be created seperately in the target account"
+
+Resources:
+
+  ECSSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+        GroupName: !Sub '${AWS::StackName}-SGECS'
+        GroupDescription: "Security Group for ECS Jenkins"
+        VpcId: !Ref "VpcId"
+        SecurityGroupIngress:
+        - IpProtocol: "tcp"
+          FromPort: "8080"
+          ToPort: "8080"
+          CidrIp: !Ref "SubnetCidr"
+        - IpProtocol: "tcp"
+          FromPort: "80"
+          ToPort: "80"
+          CidrIp: !Ref "SubnetCidr"
+        - IpProtocol: "tcp"
+          FromPort: "443"
+          ToPort: "443"
+          CidrIp: !Ref "SubnetCidr"
+        - IpProtocol: "tcp"
+          FromPort: "50000"
+          ToPort: "50000"
+          CidrIp: !Ref "SubnetCidr"
+        SecurityGroupEgress:
+        - IpProtocol: "-1"
+          CidrIp: "0.0.0.0/0"
+          
+  EC2Role:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: "Jenkins-Worker-Lab-EC2Role"
+      ManagedPolicyArns:
+        - "arn:aws:iam::aws:policy/AWSCodeCommitReadOnly"
+      AssumeRolePolicyDocument:
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service: [ec2.amazonaws.com]
+          Action: ['sts:AssumeRole']
+      Path: /
+      Policies:
+      - PolicyName: ecs-service
+        PolicyDocument:
+          Statement:
+          - Effect: Allow
+            Action: ['ecs:CreateCluster', 'ecs:DeregisterContainerInstance', 'ecs:DiscoverPollEndpoint',
+              'ecs:Poll', 'ecs:RegisterContainerInstance', 'ecs:StartTelemetrySession',
+              'ecs:Submit*', 'logs:CreateLogStream', 'logs:PutLogEvents', "ecs:ListClusters", "ecs:DescribeContainerInstances",
+              "ecs:RegisterTaskDefinition", "ecs:DeregisterTaskDefinition", "ecs:ListTaskDefinitions", "ecs:DescribeTaskDefinition",
+              "ecs:RunTask", "ecs:StopTask", "ecs:ListContainerInstances", "ecs:DescribeTasks",
+              "ecr:GetAuthorizationToken", "ecr:GetDownloadUrlForLayer", "ecr:BatchGetImage", "ecr:BatchCheckLayerAvailability"]
+            Resource: '*'
+      - PolicyName: allow-assume-appaccount
+        PolicyDocument:
+          Statement:
+          - Effect: Allow
+            Action: ['sts:AssumeRole']
+            Resource: !Sub 'arn:aws:iam::*:role/${AppAccountAssumeRole}'
+
+  AutoscalingRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service: [application-autoscaling.amazonaws.com]
+          Action: ['sts:AssumeRole']
+      Path: /
+      Policies:
+      - PolicyName: service-autoscaling
+        PolicyDocument:
+          Statement:
+          - Effect: Allow
+            Action: ['application-autoscaling:*', 'cloudwatch:DescribeAlarms', 'cloudwatch:PutMetricAlarm',
+              'ecs:DescribeServices', 'ecs:UpdateService']
+            Resource: '*'
+
+  EC2InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Path: /
+      Roles: 
+        - !Ref "EC2Role"
+
+  ECSLaunchConfig:
+    Type: AWS::AutoScaling::LaunchConfiguration
+    DependsOn:
+      - "ECSSG"
+    Properties:
+      EbsOptimized: "false"
+      IamInstanceProfile: !Ref EC2InstanceProfile
+      ImageId: !Ref ImageId
+      InstanceMonitoring: "true"
+      InstanceType: !Ref "InstanceType"
+      KeyName: !Ref "KeyName"
+      SecurityGroups: 
+        - !GetAtt "ECSSG.GroupId"
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          #Cfn Signal
+          yum install -y aws-cfn-bootstrap
+          /opt/aws/bin/cfn-signal -e $? --stack ${AWS::StackName} --resource ECSAutoScalingGroup --region ${AWS::Region}      
+          
+          # yum update
+          yum update -y
+
+          # ECS config
+          ${ECSConfig}
+          {
+            echo ECS_CLUSTER=${AWS::StackName}-${AppName}
+            echo ECS_AVAILABLE_LOGGING_DRIVERS=[\"json-file\",\"awslogs\"]
+            echo ECS_RESERVED_MEMORY=${ECSReservedMem}
+          } >> /etc/ecs/ecs.config
+                
+          # Installing CloudWatch Log Agent
+          yum install -y awslogs
+                
+          # Inject the CloudWatch Logs configuration file contents
+          cat > /etc/awslogs/awslogs.conf <<- EOF
+          [general]
+          state_file = /var/lib/awslogs/agent-state        
+                
+          [${ECSInitLogStream}]
+          file = ${ECSInitLogPath}
+          log_group_name = ${ECSLogGroup}
+          log_stream_name = {instance_id}${ECSInitLogStream}
+          datetime_format = %Y-%m-%dT%H:%M:%SZ
+                
+          [${ECSAgentLogStream}]
+          file = ${ECSAgentLogPath}
+          log_group_name = ${ECSLogGroup}
+          log_stream_name = {instance_id}${ECSAgentLogStream}
+          datetime_format = %Y-%m-%dT%H:%M:%SZ
+                
+          [${ECSCniBridgeLogStream}]
+          file = ${ECSCniBridgeLogPath}
+          log_group_name = ${ECSLogGroup}
+          log_stream_name = {instance_id}${ECSCniBridgeLogStream}
+          datetime_format = %Y-%m-%dT%H:%M:%SZ
+                
+          [${ECSCniEniLogStream}]
+          file = ${ECSCniEniLogPath}
+          log_group_name = ${ECSLogGroup}
+          log_stream_name = {instance_id}${ECSCniEniLogStream}
+          datetime_format = %Y-%m-%dT%H:%M:%SZ
+          EOF
+                
+          # Set the region to send CloudWatch Logs data to (the region where the container instance is located)
+          sed -i -e "s/region = us-east-1/region = ${AWS::Region}/g" /etc/awslogs/awscli.conf
+          systemctl enable awslogsd.service
+          systemctl start awslogsd
+
+                
+          ${CustomUserdata}
+          echo "Done"
+          #######EndOfUserData#####
+
+  ECSCluster:          
+    Type: AWS::ECS::Cluster
+    Properties: 
+      ClusterName: !Sub '${AWS::StackName}-${AppName}'
+      Tags: 
+        - Key: "Env"
+          Value: !Ref Environment 
+        - Key: "Name"
+          Value: !Ref "AppName"
+
+  ECSAutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    DependsOn: 
+      - "ECSCluster"
+    Properties:
+      VPCZoneIdentifier: !Ref SubnetId
+      LaunchConfigurationName: !Ref 'ECSLaunchConfig'
+      MinSize: "1"
+      MaxSize: "3"
+    CreationPolicy:
+      ResourceSignal:
+        Timeout: "PT15M"
+        Count: "1"
+    UpdatePolicy:
+      AutoScalingRollingUpdate:
+        MinInstancesInService: "1"
+        MaxBatchSize: "1"
+        PauseTime: "PT15M"
+        WaitOnResourceSignals: "true"
+
+
+
+  ScaleUpPolicy:
+    Type: 'AWS::AutoScaling::ScalingPolicy'
+    Properties:
+      AdjustmentType: ChangeInCapacity
+      AutoScalingGroupName: !Ref ECSAutoScalingGroup
+      Cooldown: '60'
+      ScalingAdjustment: '1'
+  ScaleDownPolicy:
+    Type: 'AWS::AutoScaling::ScalingPolicy'
+    Properties:
+      AdjustmentType: ChangeInCapacity
+      AutoScalingGroupName: !Ref ECSAutoScalingGroup
+      Cooldown: '60'
+      ScalingAdjustment: '-1'
+  CPUAlarmHigh:
+    Type: 'AWS::CloudWatch::Alarm'
+    Properties:
+      AlarmDescription: Scale-up if CPU > 90% for 10 minutes
+      MetricName: CPUUtilization
+      Namespace: AWS/EC2
+      Statistic: Average
+      Period: '300'
+      EvaluationPeriods: '2'
+      Threshold: '90'
+      AlarmActions:
+        - !Ref ScaleUpPolicy
+      Dimensions:
+        - Name: AutoScalingGroupName
+          Value: !Ref ECSAutoScalingGroup
+      ComparisonOperator: GreaterThanThreshold
+  CPUAlarmLow:
+    Type: 'AWS::CloudWatch::Alarm'
+    Properties:
+      AlarmDescription: Scale-down if CPU < 70% for 10 minutes
+      MetricName: CPUUtilization
+      Namespace: AWS/EC2
+      Statistic: Average
+      Period: '300'
+      EvaluationPeriods: '2'
+      Threshold: '60'
+      AlarmActions:
+        - !Ref ScaleDownPolicy
+      Dimensions:
+        - Name: AutoScalingGroupName
+          Value: !Ref ECSAutoScalingGroup
+      ComparisonOperator: LessThanThreshold
+
+Outputs:
+  SecurityGroupId:
+    Description: "Security group for Jenkins Worker"
+    Value: !GetAtt "ECSSG.GroupId"
+  ECSCluster:
+    Description: "ECS Cluster for Jenkins Worker"
+    Value: !Ref "ECSCluster"
